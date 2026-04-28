@@ -158,6 +158,15 @@ strings short and stable.
 Plugin maps Docker exit info onto these strings; CodaClaw host's
 container-runtime layer is the source of truth.
 
+**Note on `host unreachable`:** the table value (`"host
+unreachable"`) is the stable user-facing form surfaced via
+`coda agent ls` and `Status.Detail`. The failure-mode prose
+elsewhere mentions stderr `host unreachable: <path>` — that is
+the debug form on stderr only, not the `Detail` field. The two
+are intentionally different: `Detail` stays brief and stable so
+string-matching against it does not break when paths change;
+stderr carries the path for operator debugging.
+
 ### `output <sessionID> [--since=<RFC3339>]`
 
 1. Plugin calls CodaClaw host: read `outbound.db` rows for this
@@ -318,6 +327,12 @@ plus a plugin-side parser; both follow #173.
   extended (separate CodaClaw card) to recognize `channel_type=coda`
   and surface sender/type to the agent.
 
+The envelope's `body` field is **utf-8 text, not base64**. The
+plugin decodes the wire-side `session.Message.Body []byte` (which
+is base64 in the JSON contract per `providers.md`) before writing
+the envelope, so the agent-runner reads plain text directly.
+Base64 in `inbound.db` would be hostile to the agent.
+
 ### Outbound (CodaClaw → coda)
 
 `Output` reads `outbound.db` rows where:
@@ -328,7 +343,13 @@ plus a plugin-side parser; both follow #173.
 Returns `session.Message` array with:
 
 - `From`: agent name
-- `To`: original sender (parsed from inbound envelope context)
+- `To`: original sender of the most recent inbound coda message on
+  this session. **The CodaClaw host tracks last-inbound-sender per
+  coda-managed session** and surfaces it via the IPC contract; the
+  plugin does not maintain its own cache. (Implementation detail
+  for the host-side IPC card: a `last_coda_sender` column on the
+  session row, updated on every `channel_type='coda'` inbound
+  write, returned alongside outbound rows from `output`.)
 - `Type`: `"note"` (v0)
 - `Body`: raw text bytes
 - `CreatedAt`: row's `created_at`
