@@ -93,6 +93,18 @@ namespacing, no translation layer.
 plugin returns as soon as it has the session ID; the actual
 container readiness is observed via `Health()`.
 
+**Failure modes:** if the CodaClaw host is unreachable at
+`host_endpoint` (Unix socket missing, host process not running),
+the plugin exits non-zero with stderr `host unreachable: <path>`.
+coda surfaces this as a transient `Provider.Start` error; the
+agent stays in `created` state. Same shape applies to `stop`,
+`deliver`, `health`, and `output`: host-unreachable → exit
+non-zero, stderr identifies the missing endpoint, coda treats it
+as transient. This contract matters for #174 — other plugins
+(focus, soul) won't have a host process at all, and #173 should
+not implicitly establish "plugin always assumes a host" as a
+pattern.
+
 ### `stop <sessionID>`
 
 1. Plugin calls CodaClaw host: stop container + mark session
@@ -128,11 +140,23 @@ Mapping:
 | `wakeContainer` called, Docker spawn pending | `started` | `false` | `"container starting"` |
 | container running, heartbeat current | `running` | `true` | `""` |
 | container exited normally | `stopped` | `false` | `"exited normally"` |
-| container crashed | `stopped` | `false` | `"crashed: <reason>"` |
+| container crashed | `stopped` | `false` | `"crashed: <reason>"` (see taxonomy) |
 | host process unreachable | (last known) | `false` | `"host unreachable"` |
 
 `Detail` is user-facing — coda surfaces it in `coda agent ls`. Keep
 strings short and stable.
+
+**Crash reason taxonomy** (canonical set, not freeform):
+
+| `<reason>` | Meaning |
+|---|---|
+| `oom` | Container killed by OOM-killer |
+| `exit-code-N` | Container exited non-zero with code `N` (e.g. `exit-code-137`) |
+| `host-killed` | Host process killed the container outside `Stop()` (sweep, manual) |
+| `unknown` | Container died without a recognized signal |
+
+Plugin maps Docker exit info onto these strings; CodaClaw host's
+container-runtime layer is the source of truth.
 
 ### `output <sessionID> [--since=<RFC3339>]`
 
@@ -148,11 +172,25 @@ strings short and stable.
 > cursor on `outbound.db` for coda-mediated rows. CodaClaw host-side
 > delivery MUST NOT also drain those rows.
 
-If both drain, double-delivery is guaranteed. Mechanism: the
-session row carries a `coda_managed` flag (or equivalent —
-implementation detail of the CodaClaw host). For coda-managed
-sessions, CodaClaw's own delivery loop skips coda-mediated rows;
-A2A and other channel types continue to drain normally.
+If both drain, double-delivery is guaranteed.
+
+The invariant is implemented by **two orthogonal flags** that
+answer different questions:
+
+- `channel_type='coda'` (per-row, on `inbound.db`/`outbound.db`):
+  **wire-level row discriminant.** Identifies an individual
+  message as coda-mediated. Sits in the same taxonomy as
+  CodaClaw's existing `agent`/`slack`/`discord` values.
+- `coda_managed=true` (per-session, on the session row):
+  **host-side delivery filter.** Tells CodaClaw's own delivery
+  loop to defer to coda for this session's `channel_type='coda'`
+  rows.
+
+The two compose. A `coda_managed=true` session can still receive
+A2A messages (`channel_type='agent'`) from another CodaClaw agent;
+those rows are drained normally by CodaClaw's delivery loop. coda's
+`Output()` filters strictly on `channel_type='coda'`, never on
+`coda_managed`. Different lifetimes, different scopes, both needed.
 
 A2A traffic (`channel_type='agent'`, CodaClaw agent ↔ CodaClaw
 agent) is **invisible to coda by design** (per Ash). Two reasons:
@@ -178,15 +216,15 @@ stdin/stdout/stderr from coda's controlling terminal and execs a
 child process with those streams attached, same pattern `git
 commit` uses to launch `$EDITOR`. Block until the user disconnects.
 
-**⚠️ Coda-side dependency:** As of the time of this draft,
-`evanstern/coda` `internal/plugin/provider.go:162-165`
-implements `SubprocessProvider.Attach` via `runJSON(...)`, which
-captures stdout/stderr into `bytes.Buffer` and discards them on
-success. That swallows the chat REPL output instead of streaming
-it. Attach implementation in #173 is **blocked** until the
-coda-side `SubprocessProvider.Attach` is patched to inherit stdio
-(small change — separate code path that does not call `runJSON`).
-Flagged to ash via bus, separate coda-side card to follow.
+**Coda-side dependency: resolved.** Earlier drafts of this spec
+flagged `evanstern/coda` `internal/plugin/provider.go:162-165` as
+a blocker — the original `SubprocessProvider.Attach` used
+`runJSON(...)` which captured stdout/stderr into `bytes.Buffer`
+and swallowed the chat REPL output. That was tracked as
+`evanstern/coda` #199, merged at `fc5c94b` on main: Attach now
+inherits stdio unconditionally (no `tty.IsTerminal` fallback,
+matching the `git commit` → `$EDITOR` pattern). Step 4 of the
+implementation plan is unblocked.
 
 ## ProviderConfig keys
 
@@ -200,7 +238,7 @@ strings; structured types serialize to comma-separated strings.
 | `host_endpoint` | no | `~/.codaclaw/host.sock` | Unix socket path to the CodaClaw host. v0 is Unix-socket-only; HTTP override is a v1 follow-up. |
 | `mount_allowlist` | no | `""` | Comma-separated host paths the agent is allowed to mount (CodaClaw enforces) |
 | `personality_dir` | no | `""` | Path to personality config directory mounted into the container at boot (e.g. `~/.config/coda/personalities/<agent>`) |
-| `agents_md_overlay` | no | `""` | Optional path to project AGENTS.md, mounted as a context overlay |
+| `agents_md_path` | no | `""` | Optional path to project AGENTS.md, mounted into the container |
 | `anthropic_base_url` | no | inherited from CodaClaw host env | URL for CLIProxyAPI or direct Anthropic API |
 | `anthropic_api_key_env` | no | `ANTHROPIC_API_KEY` | **Name of the env var** holding the API key on the host. Never the key itself — secrets do not belong in `ProviderConfig`, which serializes into `coda.db`. |
 | `group_slug` | no | derived from agent name | Override for the CodaClaw group slug |
@@ -210,6 +248,33 @@ Format notes:
 - `mount_allowlist`: comma-separated. Spaces around commas
   ignored. Empty string = no extra mounts.
 - All paths support `~/` expansion at the plugin layer.
+
+## Installation
+
+Per `evanstern/coda` `docs/plugin-contracts/plugins.md:74-78`:
+
+> `install` is a path (relative to plugin root) the user can run
+> after dropping the plugin directory in place. **The host does
+> not run it automatically.**
+
+So the plugin ships its own install script. `plugin.json` declares
+`"install": "scripts/install.sh"`; the user runs `bash
+scripts/install.sh` after placing the plugin directory under
+`$XDG_CONFIG_HOME/coda/plugins/coda-codaclaw/` (or after `coda
+plugin install` clones it — that command is a v1 follow-up; v0 is
+manual clone).
+
+`scripts/install.sh` responsibilities:
+
+1. `go build -o bin/coda-codaclaw ./cmd/coda-codaclaw`
+2. Optional: check that Docker is on `PATH` and the CodaClaw host
+   is reachable at the default socket path. Warn-only; do not
+   block install.
+3. Exit 0 on success, non-zero on build failure.
+
+The build artifact lives at `bin/coda-codaclaw`, which the
+`provides.providers.codaclaw.exec` field in `plugin.json` already
+points at.
 
 ## Message body encoding
 
@@ -319,30 +384,40 @@ Cut into focus cards once ash signs off. Suggested sequence:
 2. **Plugin scaffold subcommands** (this repo): wire each subcommand
    to the IPC client. Hardcoded host-endpoint default; ProviderConfig
    keys threaded through.
-3. **Coda-side attach patch** (coda repo, separate card):
-   `SubprocessProvider.Attach` uses inherited stdio. Blocks step 4.
+3. **Coda-side attach patch — DONE.** Tracked as `evanstern/coda`
+   #199, merged at `fc5c94b` on main. `SubprocessProvider.Attach`
+   now inherits stdio (no `runJSON` capture). Unblocks step 4.
 4. **Plugin attach** (this repo): `exec.Command("pnpm", "run",
    "chat", agent)` with TTY inherit.
-5. **End-to-end smoke**: register coda-codaclaw via `coda plugin
-   install`, create an agent with `provider=codaclaw`, run
-   `coda send` and verify round-trip. Mirror of #165 round-trip
-   but through the provider abstraction.
-6. **Cursor-ownership flag** (CodaClaw repo): `coda_managed`
-   field on session row + delivery-loop filter. May land earlier
-   if step 5 reveals double-delivery.
+5. **Cursor-ownership flag** (CodaClaw repo): `coda_managed` field
+   on session row + delivery-loop filter that skips
+   `channel_type='coda'` rows for those sessions. **Precondition,
+   not contingency** — double-delivery is invisible until it
+   isn't, and adding the flag is cheaper than chasing duplicate-
+   message reports later.
+6. **End-to-end smoke**: register coda-codaclaw via manual install,
+   create an agent with `provider=codaclaw`, run `coda send` and
+   verify round-trip. Mirror of #165 round-trip but through the
+   provider abstraction. Depends on step 5 landing first.
 
-## Open questions (for ash + zach review)
+## Resolved questions
 
-1. Confirm `channel_type="coda"` is acceptable as a new value, or
-   does ash prefer a different discriminant (e.g. session-level
-   flag instead of per-message)?
-2. ProviderConfig key naming: `host_endpoint` vs `codaclaw_host`
-   vs something else. Style precedent across other plugins
-   appreciated.
-3. Should the plugin install script (`install` field in
-   `plugin.json`) build the Go binary and deposit it at
-   `bin/coda-codaclaw`, or does coda's `coda plugin install`
-   handle that automatically? Need pointer.
+All three opens from the first draft are now closed (ash, msg #45
++ #46):
+
+1. **`channel_type='coda'` per-row + `coda_managed` per-session
+   are orthogonal and both stay.** Wire-level row discriminant vs
+   host-side delivery filter; different lifetimes, different
+   scopes. Documented under Output() invariant.
+2. **ProviderConfig key naming: unprefixed.** `host_endpoint`,
+   `image`, etc. ProviderConfig is per-agent and an agent has
+   exactly one provider, so collision is impossible by
+   construction. Ash is adding a one-paragraph naming convention
+   to coda's `docs/plugin-contracts/providers.md` as a small
+   follow-up — not a blocker.
+3. **Plugin install script builds the binary.** Per
+   `plugins.md:74-78` the host does not run install automatically.
+   See "Installation" section above.
 
 ## References
 
@@ -350,7 +425,11 @@ Cut into focus cards once ash signs off. Suggested sequence:
 - coda plugin manifest: [`docs/plugin-contracts/plugins.md`](https://github.com/evanstern/coda/blob/main/docs/plugin-contracts/plugins.md)
 - coda Provider interface: `internal/session/provider.go`
 - coda SubprocessProvider: `internal/plugin/provider.go`
+- coda attach patch (#199, merged at `fc5c94b`): unblocks attach
+  implementation in step 4
 - CodaClaw round-trip prior art: `scripts/validate-165.ts`
   (in `evanstern/codaclaw` main)
 - Bus thread: msg #33 (ash → kit), #34 (kit reply), #36 (ash
-  review), #39 (zach Q4 verdict), #41 (kit URGENT re attach gap)
+  review), #39 (zach Q4 verdict), #41 (kit URGENT re attach
+  gap), #42 (ash takes #199), #44 (kit pings spec ready), #45
+  + #46 (ash review of spec), #47 (#199 merged)
