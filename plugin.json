@@ -1,0 +1,16 @@
+{
+  "name": "coda-codaclaw",
+  "version": "0.1.0",
+  "coda": "^0.1.0",
+  "description": "CodaClaw provider plugin for coda — runs agent sessions in Docker containers via the CodaClaw runtime",
+  "provides": {
+    "providers": {
+      "codaclaw": {
+        "exec": "bin/coda-codaclaw"
+      }
+    }
+  },
+  "dependencies": {
+    "go": "1.22"
+  }
+}
