@@ -23,8 +23,9 @@ type hostMessage struct {
 }
 
 type outputResponse struct {
-	OK       bool          `json:"ok"`
-	Messages []hostMessage `json:"messages"`
+	OK             bool          `json:"ok"`
+	Messages       []hostMessage `json:"messages"`
+	LastCodaSender *string       `json:"last_coda_sender"`
 }
 
 type textEnvelope struct {
@@ -77,6 +78,17 @@ func handleOutput(args []string) int {
 		return handleCallError(err, client.SocketPath)
 	}
 
+	// Card C (codaclaw#9 at 4ddb009) added last_coda_sender per-session
+	// on the output response. It's the most recent inbound coda-side
+	// sender; we use it for Message.To on every row in this response so
+	// coda can route replies back to whoever originally sent the
+	// triggering message. From stays empty for v0 — the host doesn't
+	// surface the agent name on the output wire yet.
+	var to string
+	if resp.LastCodaSender != nil {
+		to = *resp.LastCodaSender
+	}
+
 	messages := make([]codaMessage, 0, len(resp.Messages))
 	for _, m := range resp.Messages {
 		createdAt, err := time.Parse(time.RFC3339, m.Timestamp)
@@ -90,7 +102,7 @@ func handleOutput(args []string) int {
 		messages = append(messages, codaMessage{
 			ID:        m.ID,
 			From:      "",
-			To:        "",
+			To:        to,
 			Type:      "note",
 			Body:      decodeOutputBody(m.Body),
 			CreatedAt: createdAt,

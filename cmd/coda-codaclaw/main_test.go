@@ -351,7 +351,7 @@ func TestOutput_HappyPath(t *testing.T) {
 	var captured map[string]interface{}
 	sock := startFakeHost(t, func(req json.RawMessage) json.RawMessage {
 		json.Unmarshal(req, &captured)
-		return json.RawMessage(`{"ok":true,"messages":[{"id":"out-1","timestamp":"2024-01-15T10:30:00Z","type":"text","body":"{\"text\":\"PONG\"}","cursor":"seq-5"}]}`)
+		return json.RawMessage(`{"ok":true,"messages":[{"id":"out-1","timestamp":"2024-01-15T10:30:00Z","type":"text","body":"{\"text\":\"PONG\"}","cursor":"seq-5"}],"last_coda_sender":"ash"}`)
 	})
 
 	stdout, _, code := runPlugin(t, sock, []string{"output", "sess-123", "--since=seq-3"}, "")
@@ -384,15 +384,68 @@ func TestOutput_HappyPath(t *testing.T) {
 	if msg["Cursor"] != "seq-5" {
 		t.Errorf("Cursor = %v, want seq-5", msg["Cursor"])
 	}
+	if msg["To"] != "ash" {
+		t.Errorf("To = %v, want ash (from last_coda_sender)", msg["To"])
+	}
 
-	// Body should be base64 of "PONG" (the decoded text envelope)
-	// "PONG" base64 = "UE9ORw=="
 	bodyB64, ok := msg["Body"].(string)
 	if !ok {
 		t.Fatalf("Body is not string: %T", msg["Body"])
 	}
 	if bodyB64 != "UE9ORw==" {
 		t.Errorf("Body = %q, want %q (base64 of 'PONG')", bodyB64, "UE9ORw==")
+	}
+}
+
+func TestOutput_LastCodaSender_BroadcastToAllRows(t *testing.T) {
+	sock := startFakeHost(t, func(req json.RawMessage) json.RawMessage {
+		return json.RawMessage(`{"ok":true,"messages":[` +
+			`{"id":"o1","timestamp":"2024-01-15T10:30:00Z","type":"text","body":"{\"text\":\"hi\"}","cursor":"seq-1"},` +
+			`{"id":"o2","timestamp":"2024-01-15T10:30:01Z","type":"text","body":"{\"text\":\"there\"}","cursor":"seq-2"}` +
+			`],"last_coda_sender":"zach"}`)
+	})
+
+	stdout, _, code := runPlugin(t, sock, []string{"output", "sess-1"}, "")
+	if code != 0 {
+		t.Fatalf("exit code %d, want 0", code)
+	}
+
+	var msgs []map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &msgs); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2", len(msgs))
+	}
+	for i, m := range msgs {
+		if m["To"] != "zach" {
+			t.Errorf("msg[%d].To = %v, want zach", i, m["To"])
+		}
+	}
+}
+
+func TestOutput_LastCodaSender_NullOrAbsent(t *testing.T) {
+	cases := map[string]string{
+		"null":   `{"ok":true,"messages":[{"id":"o1","timestamp":"2024-01-15T10:30:00Z","type":"text","body":"{\"text\":\"hi\"}","cursor":"seq-1"}],"last_coda_sender":null}`,
+		"absent": `{"ok":true,"messages":[{"id":"o1","timestamp":"2024-01-15T10:30:00Z","type":"text","body":"{\"text\":\"hi\"}","cursor":"seq-1"}]}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			sock := startFakeHost(t, func(req json.RawMessage) json.RawMessage {
+				return json.RawMessage(body)
+			})
+			stdout, _, code := runPlugin(t, sock, []string{"output", "sess-1"}, "")
+			if code != 0 {
+				t.Fatalf("exit code %d, want 0", code)
+			}
+			var msgs []map[string]interface{}
+			if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &msgs); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if msgs[0]["To"] != "" {
+				t.Errorf("To = %v, want empty string", msgs[0]["To"])
+			}
+		})
 	}
 }
 
