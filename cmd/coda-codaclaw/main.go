@@ -1,15 +1,3 @@
-// coda-codaclaw is the provider plugin executable that implements
-// coda's session.Provider interface against the CodaClaw runtime.
-//
-// The host (coda CLI) spawns this binary once per provider method
-// with subcommand argv: start | stop | deliver | health | output |
-// attach. Input arrives on stdin where applicable; output is JSON on
-// stdout. See docs/plugin-contracts/providers.md in evanstern/coda
-// for the full contract, and docs/specs/173-codaclaw-provider.md in
-// this repo for the CodaClaw-specific design.
-//
-// Implementation lands under card #173. v0 is a stub that prints a
-// usage error for every subcommand.
 package main
 
 import (
@@ -23,17 +11,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	var code int
 	switch os.Args[1] {
-	case "start", "stop", "deliver", "health", "output", "attach":
-		fmt.Fprintf(os.Stderr, "coda-codaclaw: %s not implemented yet (see card #173)\n", os.Args[1])
-		os.Exit(1)
+	case "start":
+		code = handleStart(os.Args[2:])
+	case "stop":
+		code = handleStop(os.Args[2:])
+	case "deliver":
+		code = handleDeliver(os.Args[2:])
+	case "health":
+		code = handleHealth(os.Args[2:])
+	case "output":
+		code = handleOutput(os.Args[2:])
+	case "attach":
+		fmt.Fprintln(os.Stderr, "coda-codaclaw: attach not implemented yet (Card E #6)")
+		code = 1
 	case "help", "--help", "-h":
 		printUsage()
 	default:
 		fmt.Fprintf(os.Stderr, "coda-codaclaw: unknown subcommand %q\n", os.Args[1])
 		printUsage()
-		os.Exit(1)
+		code = 1
 	}
+	os.Exit(code)
 }
 
 func printUsage() {
@@ -49,6 +49,5 @@ Subcommands (provider exec contract):
   output <sessionID> [--since=]  drain pending messages
   attach <sessionID>             attach to session (interactive)
 
-See https://github.com/evanstern/coda/blob/main/docs/plugin-contracts/providers.md
-for the contract; see docs/specs/173-codaclaw-provider.md for design.`)
+See https://github.com/evanstern/coda/blob/main/docs/plugin-contracts/providers.md`)
 }
